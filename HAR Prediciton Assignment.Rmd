@@ -1,0 +1,190 @@
+---
+title: "Using Machine Learning to predict how a weight lifting exercise is performed"
+author: "M. G. Kirtland Grech"
+date: "2/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r required_packages, warning=FALSE, message=FALSE, echo=FALSE}
+library(caret)
+```
+### Executive Summary
+
+In this study, data from accelerometers on the belt, forearm, arm and dumbbell of 6 participants were used in a machine learning exercise to predict the manner in which they performed barbell lifts. Two models, namely stochastic gradient boosting and random forest, were fitted to the data. The best accuracy was obtained with the random forest model, with an out-of-sample error estimate of 1.07% and a prediction accuracy of 98.8%. This model was then used to predict 20 different test cases for the _Course Project Prediction Quiz_.
+
+### Introduction
+The original weight lifting expercise that was carried out to acquire the data used in this study is described on the [Human Activity Recognition (HAR)](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). The data contains accelerometer, gyroscope and magnetometer measurements recorded while 6 participants were performing unilateral dumbbell biceps curl. Each participant repeated the exercise 10 times in 5 different ways (labeled as Class A through Class E). Class A corresponds to the exercise being done correctly, whereas each of the other classes corresponds to a specific mistake in performing the exercise. The objective of this study is to determine whether we can detect _how_ an exercise was being done by assigning it to its specific class. This information is stored in the feature _classe_.
+
+### Exploratory Data Analysis
+Two datasets were used in this analysis: a training dataset which was used for training and validation, and a testing dataset on which the final prediction was performed and answers submitted to the quiz. The datasets are available at these links and were read straight into R using the **read.csv()** function:
+
+training: <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv>
+
+testing:  <https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.cs>
+
+```{r read_data, cache=TRUE, echo=FALSE, results='hide'}
+
+train <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+test <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+dim(train)    # 19622 x 160
+dim(test)     # 20 x 160
+
+```
+
+The first step is to perform some exploratory data analysis to get a better understanding of the data, apply any data cleaning that might be needed and determine which features should be selected for the modeling exercise. The training data set contains 19622 observations with 160 variables (features), whereas the testing dataset contains 20 observations of 160 variables (features). An example of the first 20 features of the training dataset is shown below.
+
+```{r str_data, cache=TRUE, echo=FALSE}
+ str(train,list.len=20,vec.len=3)
+```
+
+As can be seen from the above some of the 160 features of them contained mostly NA, empty character strings (" ") or _#div0/0!_. Since the number of observations with these values was so large, it was deemed safer to eliminate these features rather than try to impute them. In addition, since accelerometer measurements are the focus of this study, gyroscope and magnetometer data were also excluded. Finally, since the features in the first seven columns do not contain useful information for this study, they were also removed.
+
+
+```{r clean_data, cache=TRUE, echo=FALSE, results='hide'}
+
+magnet_idx <- grep('magnet', names(train), value=FALSE)
+gyros_idx <- grep('gyros', names(train), value=FALSE)
+
+my_train <- train[,-c(1:7, magnet_idx, gyros_idx)]   
+my_test <- test[,-c(1:7, magnet_idx, gyros_idx)]
+
+# Find and remove columns that contain NA
+find_NA <- colSums(is.na(my_train))
+temp <- my_train[, (find_NA==0)]
+
+# Remove other columns that contain mostly "" or "#div0/0!"
+kurtosis_idx <-  grep('kurtosis', names(temp), value=FALSE)
+skewness_idx <- grep('skewness', names(temp), value=FALSE)
+max_yaw_idx <- grep('max_yaw', names(temp), value=FALSE)
+min_yaw_idx <- grep('min_yaw', names(temp), value=FALSE)
+amplitude_idx <- grep('amplitude', names(temp), value=FALSE)
+
+remove <- c(kurtosis_idx, skewness_idx, max_yaw_idx, min_yaw_idx, amplitude_idx)
+training <- temp[,-c(remove)]  
+dim(training)
+
+temp2 <- my_test[, (find_NA==0)]
+# Remove other columns that contain mostly "" or "#div0/0!" and column 62 which contains the problem_id 
+testing <- temp2[,-c(remove, 62)]  
+dim(testing) 
+```
+
+The following shows the first 20 features of the training dataset after data cleaning was completed. The cleaned up training dataset now consists of 19622 observations of 29 features. The same data preparation steps were also applied to the testing dataset. 
+
+```{r str_data2, cache=TRUE, echo=FALSE}
+ str(training,list.len=20,vec.len=3)
+```
+
+### Data preparation 
+
+After the datasets were cleaned one last step was performed to determine which features were highly correlated with each other. Such features need to be removed as they bring little additional information to the model. 4 features from each data set were identified as having high correlation with the other features and where therefore removed. The resulting final training dataset contained  19622 observations of 25 features and the final testing dataset contained 20 observations of 24 features. Note that is has one less feature compared to the training dataset, namely the feature _classe_, as this is to be predicted.
+
+```{r find_corr, cache=TRUE, include=FALSE}
+ncol(training)
+feature_corr <- cor(training[,1:28])  # column 29 contains the outcome so it was not included
+high_corr <- findCorrelation(feature_corr, 0.9)
+training <- training[, -high_corr]
+dim(training)
+ncol(training)
+testing <- testing[, -high_corr]
+dim(testing)
+```
+
+The next step is to divide the training dataset into a training and validation datasets, with 75% of the data to be used for training and 25% for validation. The validation dataset will be used to test the prediction accuracy of the model prior to using it for prediction on the testing dataset. This is done using the **createDataPartition()** function from the _caret_ package in R as shown in the following code:
+
+```{r split_data, cache=TRUE}
+set.seed(10)
+inTrain <- createDataPartition(y=training$classe, p=3/4, list=FALSE)
+train_data <- training[inTrain,]
+valid_data <- training[-inTrain,]
+```
+
+### Model building and evaluation
+Two different types of models were fitted, stochastic gradient boosting (**gbm**) and random forest (**rf**). Since the initial results from **gbm** were not as accurate as desired, **expand.grid** was used to tune the model. The metric chosen to evaluate model performance was "Accuracy". Since the dataset is quite large, parallel processing was also implemented to speed up computation.
+
+Model training and parameter turning was achieved using the **train()** function from the _caret_ package. To ensure that the model has a low bias and low variance, k-fold cross validation was used for the resampling scheme, with k set to 10 and specified using **trainControl()**. This was used for both the **gbm** and **rf** models.
+
+
+```{r model, cache=TRUE, message=FALSE}
+# Configure parallel processing
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # leave 1 core for the operating system
+registerDoParallel(cluster)
+
+# Do 6 separate 10 fold cross-validations for the resampling scheme
+fit_ctrl <- trainControl(method="repeatedcv", 
+                         number=10, repeats=6,
+                         allowParallel = TRUE)
+
+# Fit a random forest model
+set.seed(20)
+RF_fit <- train(classe ~ ., method='rf', data=train_data, 
+                metric="Accuracy",
+                trControl = fit_ctrl)
+
+# Fit a gbm model
+gbm_grid <- expand.grid(n.trees = (1:30)*5,
+                        interaction.depth = c(1,5,9),
+                        shrinkage = 0.1,
+                        n.minobsinnode =20)
+
+set.seed(20)
+GBM_fit <- train(classe ~ ., method='gbm', data=train_data, 
+                 metric="Accuracy",
+                 trControl = fit_ctrl, verbose=FALSE,
+                 tuneGrid = gbm_grid)
+
+# Shut down the cluster used for parallel processing
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+The results of the two models can be compared either as a summary (using **resamples()**) or pictorially using box plots as shown in Figure 1. From the summary and box plot comparison we see that the random forest model has a slightly higher accuracy than the stochastic boosting model, hence we will select the random forest model to make predictions on the validation and testing datasets. 
+
+```{r plot_models, cache=TRUE, echo= FALSE, message=FALSE}
+# Compare the two models
+compare_models <- resamples(list(GBM = GBM_fit,
+                                 RF  = RF_fit))
+summary(compare_models)
+bwplot(compare_models, col="blue", main="Figure 1. Comparison of RF and GBM model")
+```
+
+The general effect of predictors on our selected model can be examined using the **varImp()** function and plotted out as show in Figure 2. It shows that the first 4 features had the largest impact on the model, with an importance of 40 or higher.
+```{r plot_varImp, cache=TRUE, message=FALSE}
+varimp_RF <- varImp(RF_fit)
+plot(varimp_RF, main="Figure 2. Variable Importance with Random Forest")
+```
+
+Additional details for the rain forest model are shown below. 
+```{r accuracy, cache=TRUE, include=FALSE}
+RF_fit
+```
+
+```{r OOB, cache=TRUE, include=FALSE, results="hide"}
+RF_fit$finalModel
+```
+We can see that the final value selected for mtry = 13 which had the highest accuracy of 0.987792 (98.8%). The out-of-bag (or out-of-sample) error estimate can be obtained by examining the output from **RF_fit$finalModel** and was found to be 0.0107 (or 1.07%). The high accuracy and low out-of-sample error estimate reflect the strong performance of the model. 
+
+### Predict the "classe" on the validation dataset
+Now that we have selected our model, we can use it to predict the _classe_ on the validation dataset that we have kept aside for this purpose. The predicted results can then be compared with the true values contained in the _valid_data$classe_ as shown below. Note how the majority of the classes were predicted correctly. In fact only 53 predictions out of 4,894 were incorrect, giving an error rate of 1.08%, very close to the out-of-sample error rate obtained on the training dataset. 
+
+```{r predict, cache=TRUE, message=FALSE}
+pred_valid <- predict(RF_fit,valid_data)
+table(pred_valid,valid_data$classe)
+```
+
+### Predict the "classe" on the testing dataset
+Given the high prediction accuracy obtained on the validation dataset, we can proceed to use it to predict the "classe" on the testing data as shown below. The answers were submitted too the _Course Project Prediction Quiz_ as instructed.
+
+```{r pred_test, cache=TRUE}
+pred <- predict(RF_fit,testing)
+```
+
+### Conclusion
+In this study we have seen how two different machine learning models, stochastic boosting (**gbm**) and random forest (**rf**) from the _caret_ package in R, were built and used to predict the way in which a dumbbell lifting exercise was performed. 10-fold cross validation with 6 repetitions was used for the resampling technique to obtain low bias and low variance. The best predicted results were obtained using the random forest model, with an out-of-sample error estimate of 1.07% and an accuracy of 98.8%. The model was used to predict the results on the testing dataset to obtain the answers for the _Course Project Prediction Quiz_.
